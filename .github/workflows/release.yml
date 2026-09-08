@@ -1,0 +1,224 @@
+name: Release
+
+# Builds the portable Windows .exe + standalone bundle and attaches them
+# to the GitHub Release via the official `gh` CLI.
+#
+# Trigger it EITHER by pushing a tag:
+#     git tag v1.0.0 && git push origin v1.0.0
+# OR manually: Actions -> Release -> Run workflow -> enter the tag (e.g. v1.0.0).
+
+on:
+  push:
+    tags: [ 'v*' ]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to (re)publish, e.g. v1.0.0'
+        required: true
+        default: 'v1.0.0'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ───────────────────────────────────────────────────────────────
+  # Job 1: cross-platform standalone bundle (Linux)
+  # ───────────────────────────────────────────────────────────────
+  standalone:
+    name: Standalone bundle
+    runs-on: ubuntu-latest
+    env:
+      DB_FILE: /tmp/yawareleasebot-ci.db
+      NEXT_TELEMETRY_DISABLED: 1
+      RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: 'npm'
+      - name: Install dependencies
+        run: npm ci
+      - name: Generate types + check
+        run: |
+          npx next typegen
+          npx tsc --noEmit
+      - name: Production build
+        run: npm run build
+      - name: Package standalone bundle
+        run: |
+          set -euo pipefail
+          echo "Release tag: $RELEASE_TAG"
+          cp -r .next/static .next/standalone/.next/
+          if [ -d public ]; then cp -r public .next/standalone/; fi
+          cp .env.example .next/standalone/.env.example
+          cp README.md .next/standalone/README.md
+          rm -f .next/standalone/.env
+          SAFE_REF=$(echo "$RELEASE_TAG" | tr '/' '-')
+          NAME="YawaReleaseBot-${SAFE_REF}-${GITHUB_SHA::7}"
+          mkdir -p artifact
+          (cd .next/standalone && zip -qr "../../artifact/${NAME}.zip" .)
+          (cd .next/standalone && tar -czf "../../artifact/${NAME}.tar.gz" .)
+          ls -lh artifact
+      - name: Upload standalone artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: standalone-bundle
+          path: artifact/*
+          if-no-files-found: error
+
+  # ───────────────────────────────────────────────────────────────
+  # Job 2: portable Windows .exe (Windows runner)
+  #
+  # The exe embeds: Electron shell + Next.js standalone server +
+  # a bundled Node.js runtime + SQLite DB. One file, zero setup.
+  # ───────────────────────────────────────────────────────────────
+  desktop-exe:
+    name: Windows .exe (portable)
+    runs-on: windows-latest
+    env:
+      DB_FILE: C:\\yawareleasebot-ci.db
+      NEXT_TELEMETRY_DISABLED: 1
+      CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+      RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: 'npm'
+      - name: Install root dependencies
+        run: npm ci
+      - name: Generate types + check
+        run: |
+          npx next typegen
+          npx tsc --noEmit
+      # The Electron app embeds .next/standalone as extraResources, so we must
+      # produce the standalone build first, including the static assets.
+      - name: Production build (standalone)
+        run: npm run build
+      - name: Copy static assets into standalone
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp -r .next/static .next/standalone/.next/
+          if [ -d public ]; then cp -r public .next/standalone/; fi
+          cp .env.example .next/standalone/.env.example
+          rm -f .next/standalone/.env
+      # Ship a real Node.js runtime inside the exe so the embedded server
+      # (with its native SQLite module) runs on any PC without Node installed.
+      - name: Bundle Node.js runtime into the package
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $nodeVer = (node -v).TrimStart('v')
+          $url = "https://nodejs.org/dist/v$nodeVer/node-v$nodeVer-win-x64.zip"
+          Write-Host "Downloading $url"
+          Invoke-WebRequest -Uri $url -OutFile "$env:RUNNER_TEMP\node.zip"
+          $dest = Join-Path $env:RUNNER_TEMP 'node-portable'
+          if (Test-Path $dest) { Remove-Item $dest -Recurse -Force }
+          Expand-Archive -Path "$env:RUNNER_TEMP\node.zip" -DestinationPath $dest -Force
+          $nodeExe = Get-ChildItem -Path $dest -Recurse -Filter node.exe | Select-Object -First 1
+          if (-not $nodeExe) { throw 'node.exe not found in the downloaded archive' }
+          New-Item -ItemType Directory -Force -Path '.next\standalone\bin' | Out-Null
+          Copy-Item $nodeExe.FullName '.next\standalone\bin\node.exe' -Force
+          $item = Get-Item '.next\standalone\bin\node.exe'
+          Write-Host "Bundled: $($item.FullName) ($([math]::Round($item.Length / 1MB, 1)) MB)"
+      - name: Install desktop toolchain
+        working-directory: desktop
+        run: npm ci
+      # Make the exe file name + metadata match the release tag (v1.2.0 -> 1.2.0).
+      - name: Sync desktop version with release tag
+        working-directory: desktop
+        shell: bash
+        run: |
+          TAG="$RELEASE_TAG"
+          VER="${TAG#v}"
+          if [[ "$VER" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.-]+)?$ ]]; then
+            echo "Setting desktop version to $VER (from tag $TAG)"
+            node -e "
+              const fs = require('fs');
+              const v = process.argv[1];
+              const pj = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+              pj.version = v;
+              fs.writeFileSync('package.json', JSON.stringify(pj, null, 2) + '\n');
+              const pl = JSON.parse(fs.readFileSync('package-lock.json', 'utf8'));
+              pl.version = v;
+              if (pl.packages && pl.packages['']) pl.packages[''].version = v;
+              fs.writeFileSync('package-lock.json', JSON.stringify(pl, null, 2) + '\n');
+              console.log('desktop version ->', v);
+            " "$VER"
+          else
+            echo "Tag '$TAG' is not semver — keeping version from package.json"
+          fi
+      - name: Build portable .exe
+        working-directory: desktop
+        run: npx electron-builder --win portable
+      - name: List produced exe
+        working-directory: desktop
+        shell: bash
+        run: ls -lh dist/*.exe
+      - name: Upload .exe artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-exe
+          path: desktop/dist/*.exe
+          if-no-files-found: error
+
+  # ───────────────────────────────────────────────────────────────
+  # Job 3: publish everything to the GitHub Release
+  # ───────────────────────────────────────────────────────────────
+  publish:
+    name: Publish GitHub Release
+    needs: [ standalone, desktop-exe ]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+    steps:
+      - name: Download standalone bundle
+        uses: actions/download-artifact@v4
+        with:
+          name: standalone-bundle
+          path: assets/standalone
+      - name: Download Windows .exe
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-exe
+          path: assets/exe
+      - name: List assembled assets
+        run: |
+          echo "Release tag: $RELEASE_TAG"
+          find assets -type f | sort
+      - name: Create or update GitHub Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="$RELEASE_TAG"
+          REPO="${GITHUB_REPOSITORY}"
+
+          if ! gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+            echo "Creating release $TAG ..."
+            gh release create "$TAG" \
+              --repo "$REPO" \
+              --target "${GITHUB_SHA}" \
+              --title "YawaReleaseBot $TAG" \
+              --generate-notes
+          else
+            echo "Release $TAG already exists — uploading assets."
+          fi
+
+          while IFS= read -r f; do
+            echo "Uploading $f"
+            gh release upload "$TAG" "$f" --repo "$REPO" --clobber
+          done < <(find assets -type f)
+
+          echo "Assets attached to release:"
+          gh release view "$TAG" --repo "$REPO" --json assets --jq '.assets[].name' || true

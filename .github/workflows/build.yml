@@ -1,0 +1,102 @@
+name: Build
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build & verify
+    runs-on: ubuntu-latest
+    env:
+      DB_FILE: /tmp/yawareleasebot-ci.db
+      NEXT_TELEMETRY_DISABLED: 1
+
+    steps:
+      # v5 actions run on the Node 24 runtime (Node 20 is deprecated on GitHub runners).
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      # Node 24 is the current LTS. The npm cache is enabled ONLY when package-lock.json
+      # exists, so the job never fails with "Dependencies lock file is not found".
+      - name: Setup Node.js 24
+        uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: ${{ hashFiles('package-lock.json') != '' && 'npm' || '' }}
+
+      - name: Install dependencies
+        run: |
+          if [ -f package-lock.json ]; then
+            echo "package-lock.json found -> npm ci"
+            npm ci
+          else
+            echo "::warning title=package-lock.json is missing::Falling back to 'npm install'. Commit package-lock.json for reproducible builds (run 'npm install' locally and commit the generated file)."
+            npm install --no-audit --no-fund
+          fi
+
+      - name: Generate route types
+        run: npx next typegen
+
+      - name: TypeScript check
+        run: npx tsc --noEmit
+
+      - name: Production build
+        run: npm run build
+
+      # ─────────────────────────────────────────────────────────────────────
+      # Packaging runs on EVERY successful build (not only tags), so a
+      # downloadable artifact is always attached to the workflow run summary.
+      # Produces a self-contained Next.js standalone bundle (run: node server.js).
+      # ─────────────────────────────────────────────────────────────────────
+      - name: Package standalone build
+        id: package
+        run: |
+          set -euo pipefail
+
+          # Next.js standalone output does not include static assets — copy them in.
+          cp -r .next/static .next/standalone/.next/
+          if [ -d public ]; then
+            cp -r public .next/standalone/
+          fi
+          cp .env.example .next/standalone/.env.example
+          cp README.md .next/standalone/README.md
+
+          # Safety: never ship a local .env file (may contain real secrets/credentials).
+          rm -f .next/standalone/.env
+
+          SAFE_REF=$(echo "${GITHUB_REF_NAME}" | tr '/' '-')
+          NAME="YawaReleaseBot-${SAFE_REF}-${GITHUB_SHA::7}"
+
+          mkdir -p release
+          tar -czf "release/${NAME}.tar.gz" -C .next/standalone .
+          (cd .next/standalone && zip -qr "../../release/${NAME}.zip" .)
+
+          echo "artifact_name=${NAME}" >> "$GITHUB_OUTPUT"
+          ls -lh release
+
+      # Always upload the packaged build as a workflow artifact — downloadable
+      # from the "Summary" page of any run, no tag required.
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package.outputs.artifact_name }}
+          path: release/*
+          retention-days: 30
+          if-no-files-found: error
+
+      # NOTE: A real GitHub Release (with assets attached to a tag) is handled
+      # by the dedicated "Release" workflow (.github/workflows/release.yml).
+      # It builds the Windows .exe + standalone bundle and publishes assets via
+      # the official `gh` CLI, which reliably attaches files on every run —
+      # including when the release/tag already exists.

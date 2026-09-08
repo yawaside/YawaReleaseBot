@@ -1,0 +1,51 @@
+{
+  "name": "yawareleasebot-desktop",
+  "productName": "YawaReleaseBot",
+  "version": "1.0.0",
+  "description": "YawaReleaseBot — локальный desktop-клиент (Electron).",
+  "main": "main.js",
+  "author": "YawaReleaseBot",
+  "license": "UNLICENSED",
+  "private": true,
+  "scripts": {
+    "build:win": "electron-builder --win portable",
+    "start": "electron ."
+  },
+  "devDependencies": {
+    "electron": "^33.2.0",
+    "electron-builder": "^25.1.8"
+  },
+  "build": {
+    "appId": "com.yawareleasebot.desktop",
+    "productName": "YawaReleaseBot",
+    "copyright": "YawaReleaseBot",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "main.js"
+    ],
+    "extraResources": [
+      {
+        "from": "../.next/standalone",
+        "to": "standalone",
+        "filter": [
+          "**/*"
+        ]
+      }
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "portable",
+          "arch": [
+            "x64"
+          ]
+        }
+      ]
+    },
+    "portable": {
+      "artifactName": "YawaReleaseBot-${version}-portable.${ext}"
+    }
+  }
+}
